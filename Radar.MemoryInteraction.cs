@@ -1,5 +1,9 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using ExileCore2;
 using ExileCore2.Shared.Helpers;
@@ -15,14 +19,34 @@ namespace Radar;
 
 public partial class Radar
 {
+    // Just moved this. Wasn't sure if the temp.png thing was actually needed or was leftover debugging.
     private void GenerateMapTexture()
     {
+        var image = BuildMapImage();
+        if (image == null)
+            return;
+        using (image)
+        {
+            //unfortunately the library doesn't respect our allocation settings inside BuildMapImage
+            using var imageCopy = image.Clone();
+            imageCopy.Save("test.png");
+            Graphics.AddOrUpdateImage(TextureName, imageCopy);
+        }
+    }
+
+    // Just moved this into its own method to share the logic between PNG and SVG generation.
+    // Was originally returning the existing png but switched to svg for scaleability
+    private Image<Rgba32> BuildMapImage()
+    {
+        if (_areaDimensions == null || _heightData == null || _processedTerrainData == null)
+            return null;
+
         var gridHeightData = _heightData;
         var maxX = _areaDimensions.Value.X;
         var maxY = _areaDimensions.Value.Y;
         var configuration = Configuration.Default.Clone();
         configuration.PreferContiguousImageBuffers = true;
-        using var image = new Image<Rgba32>(configuration, maxX, maxY);
+        var image = new Image<Rgba32>(configuration, maxX, maxY);
         if (Settings.Debug.DrawHeightMap)
         {
             var minHeight = gridHeightData.Min(x => x.Min());
@@ -220,10 +244,225 @@ public partial class Radar
             resizer.Execute();
         }
 
-        //unfortunately the library doesn't respect our allocation settings above
-
-        using var imageCopy = image.Clone(configuration);
-        imageCopy.Save("test.png");
-        Graphics.AddOrUpdateImage(TextureName, imageCopy);
+        return image;
     }
+
+    // Plugin-bridge entry point: build the current zone's map and return it as PNG bytes.
+    // includeRoutes bakes the route paths + cluster target endpoints on top via OverlayRoutes.
+    // This is used by the ExileStats plugin.
+    private byte[] GetMapImageBytes(bool includeRoutes)
+    {
+        var image = BuildMapImage();
+        if (image == null)
+            return null;
+        using (image)
+        {
+            try
+            {
+                if (includeRoutes)
+                    OverlayRoutes(image);
+
+                using var ms = new MemoryStream();
+                image.SaveAsPng(ms);
+                return ms.ToArray();
+            }
+            catch (Exception ex)
+            {
+                DebugWindow.LogError(ex.ToString());
+                return null;
+            }
+        }
+    }
+
+    // Bake the drawn route paths (and cluster target endpoints) onto the terrain image.
+    private void OverlayRoutes(Image<Rgba32> image)
+    {
+        foreach (var route in _routes.Values)
+        {
+            if (route?.Path == null)
+                continue;
+            var c = route.MapColor();
+            var px = new Rgba32(c.R, c.G, c.B, (byte)255);
+            foreach (var p in route.Path)
+                PlotDot(image, p.X, p.Y, px, 1);
+        }
+
+        var endpointColor = new Rgba32((byte)255, (byte)255, (byte)255, (byte)255);
+        foreach (var target in _clusteredTargetLocations.Values)
+        {
+            if (target?.Locations == null)
+                continue;
+            foreach (var loc in target.Locations)
+                PlotDot(image, (int)loc.X, (int)loc.Y, endpointColor, 2);
+        }
+    }
+
+    private static void PlotDot(Image<Rgba32> image, int cx, int cy, Rgba32 color, int radius)
+    {
+        var xStart = Math.Max(0, cx - radius);
+        var yStart = Math.Max(0, cy - radius);
+        var xEnd = Math.Min(image.Width - 1, cx + radius);
+        var yEnd = Math.Min(image.Height - 1, cy + radius);
+        for (var y = yStart; y <= yEnd; y++)
+            for (var x = xStart; x <= xEnd; x++)
+                image[x, y] = color;
+    }
+
+    // Plugin-bridge entry point: build the current zone's map as an SVG string (infinitely scalable).
+    private string GetMapSvgString(bool includeRoutes)
+    {
+        if (_areaDimensions == null || _processedTerrainData == null)
+            return null;
+
+        try
+        {
+            return BuildMapSvg(includeRoutes);
+        }
+        catch (Exception ex)
+        {
+            DebugWindow.LogError(ex.ToString());
+            return null;
+        }
+    }
+
+    private string BuildMapSvg(bool includeRoutes)
+    {
+        var maxX = _areaDimensions.Value.X;
+        var maxY = _areaDimensions.Value.Y;
+        var terrain = _processedTerrainData;
+
+        bool Walkable(int x, int y) =>
+            x >= 0 && y >= 0 && x < maxX && y < maxY && terrain[y][x] != 0;
+
+        var stride = (long)(maxX + 1);
+        long Key(int px, int py) => py * stride + px;
+
+        var edges = new HashSet<(int fx, int fy, int tx, int ty)>();
+        void AddEdge(int fx, int fy, int tx, int ty)
+        {
+            if (!edges.Remove((tx, ty, fx, fy))) // annihilate the reverse if present
+                edges.Add((fx, fy, tx, ty));
+        }
+
+        for (var y = 0; y < maxY; y++)
+        {
+            for (var x = 0; x < maxX; x++)
+            {
+                if (!Walkable(x, y))
+                    continue;
+                // corners: TL(x,y) TR(x+1,y) BR(x+1,y+1) BL(x,y+1), clockwise in SVG (y-down) coords
+                AddEdge(x, y, x + 1, y);         // top
+                AddEdge(x + 1, y, x + 1, y + 1); // right
+                AddEdge(x + 1, y + 1, x, y + 1); // bottom
+                AddEdge(x, y + 1, x, y);         // left
+            }
+        }
+
+        var outgoing = new Dictionary<long, List<(int tx, int ty)>>(edges.Count);
+        foreach (var (fx, fy, tx, ty) in edges)
+        {
+            var k = Key(fx, fy);
+            if (!outgoing.TryGetValue(k, out var list))
+                outgoing[k] = list = new List<(int, int)>(1);
+            list.Add((tx, ty));
+        }
+
+        var path = new StringBuilder();
+        foreach (var start in outgoing.Keys.ToList())
+        {
+            while (outgoing.TryGetValue(start, out var startList) && startList.Count > 0)
+            {
+                var loop = new List<(int x, int y)>();
+                var cx = (int)(start % stride);
+                var cy = (int)(start / stride);
+                while (true)
+                {
+                    var ck = Key(cx, cy);
+                    if (!outgoing.TryGetValue(ck, out var nexts) || nexts.Count == 0)
+                        break; // loop closed (back at a fully-consumed start)
+                    var n = nexts[^1];
+                    nexts.RemoveAt(nexts.Count - 1);
+                    loop.Add((cx, cy));
+                    cx = n.tx;
+                    cy = n.ty;
+                    if (cx == (int)(start % stride) && cy == (int)(start / stride))
+                        break;
+                }
+                AppendLoop(path, loop);
+            }
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"").Append(maxX)
+          .Append("\" height=\"").Append(maxY)
+          .Append("\" viewBox=\"0 0 ").Append(maxX).Append(' ').Append(maxY).Append("\">\n");
+
+        if (path.Length > 0)
+            sb.Append("<path fill-rule=\"evenodd\" fill=\"").Append(ToHex(Settings.TerrainColor.Value))
+              .Append("\" fill-opacity=\"").Append(F(Settings.TerrainColor.Value.A / 255f))
+              .Append("\" d=\"").Append(path).Append("\"/>\n");
+
+        if (includeRoutes)
+            AppendRoutesSvg(sb);
+
+        sb.Append("</svg>\n");
+        return sb.ToString();
+    }
+
+    private static void AppendLoop(StringBuilder path, List<(int x, int y)> loop)
+    {
+        if (loop.Count < 3)
+            return;
+
+        var pts = new List<(int x, int y)>(loop.Count);
+        for (var i = 0; i < loop.Count; i++)
+        {
+            var prev = loop[(i - 1 + loop.Count) % loop.Count];
+            var cur = loop[i];
+            var next = loop[(i + 1) % loop.Count];
+            var d1x = cur.x - prev.x;
+            var d1y = cur.y - prev.y;
+            var d2x = next.x - cur.x;
+            var d2y = next.y - cur.y;
+            if (d1x * d2y - d1y * d2x != 0 || d1x * d2x + d1y * d2y < 0) // keep corners + reversals
+                pts.Add(cur);
+        }
+
+        if (pts.Count < 3)
+            return;
+
+        path.Append('M').Append(pts[0].x).Append(' ').Append(pts[0].y);
+        for (var i = 1; i < pts.Count; i++)
+            path.Append('L').Append(pts[i].x).Append(' ').Append(pts[i].y);
+        path.Append('Z');
+    }
+
+    private void AppendRoutesSvg(StringBuilder sb)
+    {
+        foreach (var route in _routes.Values)
+        {
+            if (route?.Path == null || route.Path.Count == 0)
+                continue;
+            var c = route.MapColor();
+            sb.Append("<polyline fill=\"none\" stroke=\"").Append(ToHex(c))
+              .Append("\" stroke-width=\"1\" stroke-linejoin=\"round\" points=\"");
+            foreach (var p in route.Path)
+                sb.Append(p.X).Append(',').Append(p.Y).Append(' ');
+            sb.Append("\"/>\n");
+        }
+
+        foreach (var target in _clusteredTargetLocations.Values)
+        {
+            if (target?.Locations == null)
+                continue;
+            foreach (var loc in target.Locations)
+                sb.Append("<circle cx=\"").Append(F(loc.X)).Append("\" cy=\"").Append(F(loc.Y))
+                  .Append("\" r=\"2\" fill=\"#ffffff\"/>\n");
+        }
+    }
+
+    private static string ToHex(System.Drawing.Color c) =>
+        $"#{c.R:x2}{c.G:x2}{c.B:x2}";
+
+    private static string F(double v) => v.ToString("0.###", CultureInfo.InvariantCulture);
 }
