@@ -55,6 +55,10 @@ public partial class Radar : BaseSettingsPlugin<RadarSettings>
                 AddRoute(target, callback, cancellationToken));
         GameController.PluginBridge.SaveMethod("Radar.ClusterTarget",
             (string targetName, int expectedCount) => ClusterTarget(targetName, null, expectedCount));
+        GameController.PluginBridge.SaveMethod("Radar.GetMapImage",
+            (bool includeRoutes) => GetMapImageBytes(includeRoutes));
+        GameController.PluginBridge.SaveMethod("Radar.GetMapSvg",
+            (bool includeRoutes) => GetMapSvgString(includeRoutes));
 
         Input.RegisterKey(Settings.InstanceDumpSettings.ManualDumpHotkey.Value);
         Settings.InstanceDumpSettings.ManualDumpHotkey.OnValueChanged += () => { Input.RegisterKey(Settings.InstanceDumpSettings.ManualDumpHotkey.Value); };
